@@ -11,8 +11,15 @@ dependencies = [
 ]
 
 [project.scripts]
-tgtg = "tgtg:main"
+tgtg = "tgtg_bot.monitor:main"
+tgtg-auth = "tgtg_bot.auth:authenticate"
+tgtg-sniper = "tgtg_bot.sniper:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
