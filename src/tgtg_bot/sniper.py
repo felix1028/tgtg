@@ -112,8 +112,11 @@ def display_menu(favorites: list[dict]) -> None:
 
         profile = get_drop_tracker().get_store_profile(fav.get("item_id", ""))
         delay_badge = ""
-        if profile and profile.get("median_primary_delay_seconds") is not None:
-            delay_badge = f" (avg +{profile['median_primary_delay_seconds']}s late)"
+        if profile:
+            if profile.get("median_primary_delay_seconds") is not None:
+                delay_badge = f" (avg drops +{profile['median_primary_delay_seconds']}s late)"
+            elif profile.get("median_sold_out_delay_seconds") is not None:
+                delay_badge = f" (est. drops ~+{profile['median_sold_out_delay_seconds']}s)"
 
         if fav["items_available"] > 0:
             stock_badge = f"✅ IN STOCK ({fav['items_available']})"
@@ -374,6 +377,7 @@ def snipe_item(
     start_time = time.time()
     consecutive_errors = 0
     buy_attempts = 0
+    had_seen_stock = False
 
     first_sold_out_time: float | None = None
     redrop_target_time: float | None = None
@@ -435,6 +439,7 @@ def snipe_item(
         consecutive_errors = 0
 
         if stock > 0:
+            had_seen_stock = True
             target["info"]["items_available"] = stock
             if phase == "redrop_surge":
                 print(f"\n🎉 5-MINUTE RE-DROP DETECTED! Bag released back to inventory!")
@@ -483,6 +488,18 @@ def snipe_item(
                 target["first_sold_out_time"] = first_sold_out_time
                 redrop_target_time = first_sold_out_time + redrop_timeout_seconds
                 target["redrop_target_time"] = redrop_target_time
+
+                # Record sold-out timing in DropStatsTracker
+                try:
+                    get_drop_tracker().record_sold_out(
+                        item_id=item_id,
+                        store_name=info.get("store_name", "Store"),
+                        sold_out_time=now,
+                        scheduled_drop_time=drop_time,
+                        had_seen_stock=had_seen_stock,
+                    )
+                except Exception:
+                    pass
 
         # Compute sleep interval based on current phase
         if phase == "primary":

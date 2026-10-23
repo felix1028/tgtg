@@ -107,3 +107,31 @@ class TestDropStatsTracker:
         captured2 = capsys.readouterr()
         assert "Arsicault Bakery" in captured2.out
         assert "+28.0s" in captured2.out
+
+    def test_record_sold_out_computes_drop_timing_without_securing(self, tmp_path):
+        stats_file = tmp_path / "drop_stats.json"
+        tracker = DropStatsTracker(stats_file=stats_file)
+
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        scheduled_drop = now - datetime.timedelta(seconds=33)
+
+        entry = tracker.record_sold_out(
+            item_id="store_unsecured",
+            store_name="Contested Bakery",
+            sold_out_time=now.timestamp(),
+            scheduled_drop_time=scheduled_drop,
+            had_seen_stock=False,
+        )
+
+        assert entry["event_type"] == "sold_out"
+        assert entry["secured"] is False
+        assert entry["had_seen_stock"] is False
+        assert entry["delay_seconds"] == pytest.approx(33.0, abs=1.0)
+
+        profile = tracker.get_store_profile("store_unsecured")
+        assert profile["sold_outs_observed"] == 1
+        assert profile["median_sold_out_delay_seconds"] == pytest.approx(33.0, abs=1.0)
+        # Adaptive lead leverages sold-out delay if primary stock check was missed
+        lead = tracker.get_adaptive_lead_seconds("store_unsecured", default=23.0)
+        assert lead == 18.0
+
