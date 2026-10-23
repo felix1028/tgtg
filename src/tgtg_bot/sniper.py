@@ -33,7 +33,7 @@ from tgtg_bot.items import (
 )
 from tgtg_bot.monitor import get_client
 from tgtg_bot.notifier import send_whatsapp_message
-from tgtg_bot.stats import get_drop_tracker, seed_from_active_orders
+from tgtg_bot.stats import get_drop_tracker
 
 load_dotenv()
 
@@ -870,20 +870,11 @@ def main(args=None):
     parsed_args = parser.parse_args(args)
 
     if parsed_args.stats:
-        try:
-            client = get_client()
-            seed_from_active_orders(client)
-        except Exception:
-            pass
         get_drop_tracker().display_stats_summary()
         return
 
     with prevent_system_sleep():
         client = get_client()
-        try:
-            seed_from_active_orders(client)
-        except Exception:
-            pass
         print("Loading your favorites and drop schedules...")
         favorites = fetch_favorites_schedule(client)
 
