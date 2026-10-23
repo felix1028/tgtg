@@ -52,6 +52,7 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
         store_name = order.get("store_name", "Unknown Store")
         store_branch = order.get("store_branch", "")
         display_store = f"{store_name} ({store_branch})" if store_branch else store_name
+        bag_name = order.get("item_name") or order.get("display_name") or "Surprise Bag"
         purchase_time_str = order.get("time_of_purchase")
 
         if not purchase_time_str or not item_id:
@@ -59,9 +60,6 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
 
         purchase_dt = parse_iso_datetime(purchase_time_str)
         if not purchase_dt:
-            continue
-
-        if (item_id, purchase_dt.isoformat()) in existing_events:
             continue
 
         # Look up current item schedule
@@ -72,6 +70,18 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
                 item_cache[item_id] = {}
 
         item_detail = item_cache[item_id]
+        if bag_name == "Surprise Bag" and item_detail:
+            bag_name = item_detail.get("item", {}).get("name") or item_detail.get("display_name") or bag_name
+
+        if (item_id, purchase_dt.isoformat()) in existing_events:
+            # Enrich existing history and store entries with bag_name if missing
+            for h in tracker._data.get("history", []):
+                if h.get("item_id") == item_id and h.get("timestamp") == purchase_dt.isoformat():
+                    h["bag_name"] = bag_name
+            if item_id in tracker._data.get("stores", {}):
+                tracker._data["stores"][item_id]["bag_name"] = bag_name
+            continue
+
         sched_time_str = item_detail.get("next_sales_window_purchase_start")
         sched_dt: datetime.datetime | None = None
 
@@ -95,12 +105,13 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
                 sched_dt = None  # Schedule changed over years/months
 
         local_dt_str = purchase_dt.strftime("%Y-%m-%d %I:%M:%S %p")
-        print(f"[{idx:2d}/{len(all_orders)}] {display_store}")
+        print(f"[{idx:2d}/{len(all_orders)}] {display_store} - {bag_name}")
         print(f"     Purchased: {local_dt_str}{delay_str}")
 
         tracker.record_drop(
             item_id=item_id,
             store_name=display_store,
+            bag_name=bag_name,
             actual_stock_time=purchase_dt.timestamp(),
             scheduled_drop_time=sched_dt,
             event_type="primary",
@@ -110,7 +121,8 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
         existing_events.add((item_id, purchase_dt.isoformat()))
         imported_count += 1
 
-    print(f"\n✅ Successfully imported {imported_count} orders into {stats_file}!")
+    tracker._save()
+    print(f"\n✅ Successfully updated drop statistics with bag types in {stats_file}!")
     tracker.display_stats_summary()
 
 

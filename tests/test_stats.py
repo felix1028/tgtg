@@ -135,3 +135,66 @@ class TestDropStatsTracker:
         lead = tracker.get_adaptive_lead_seconds("store_unsecured", default=23.0)
         assert lead == 18.0
 
+    def test_multiple_bag_types_from_same_store_stay_isolated(self, tmp_path, capsys):
+        """Verify that different bag types from the same retailer (e.g. Meat vs Seafood vs Refrigerated)
+
+        maintain strictly independent statistics and do not conflate or average drop times.
+        """
+        stats_file = tmp_path / "drop_stats.json"
+        tracker = DropStatsTracker(stats_file=stats_file)
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+
+        # Meat bag: drops ~23s late
+        tracker.record_drop(
+            item_id="wf_meat",
+            store_name="Whole Foods - Los Gatos",
+            bag_name="Meat Bag",
+            actual_stock_time=now.timestamp(),
+            scheduled_drop_time=now - datetime.timedelta(seconds=23),
+        )
+
+        # Seafood bag: drops ~48s late
+        tracker.record_drop(
+            item_id="wf_seafood",
+            store_name="Whole Foods - Los Gatos",
+            bag_name="Seafood Bag",
+            actual_stock_time=now.timestamp(),
+            scheduled_drop_time=now - datetime.timedelta(seconds=48),
+        )
+
+        # Refrigerated bag: drops ~26s late
+        tracker.record_drop(
+            item_id="wf_refrigerated",
+            store_name="Whole Foods - Los Gatos",
+            bag_name="Refrigerated Grocery Bag",
+            actual_stock_time=now.timestamp(),
+            scheduled_drop_time=now - datetime.timedelta(seconds=26),
+        )
+
+        # Profiles must be strictly separated
+        meat_profile = tracker.get_item_profile("wf_meat")
+        seafood_profile = tracker.get_item_profile("wf_seafood")
+        refrig_profile = tracker.get_item_profile("wf_refrigerated")
+
+        assert meat_profile["bag_name"] == "Meat Bag"
+        assert meat_profile["median_primary_delay_seconds"] == 23.0
+
+        assert seafood_profile["bag_name"] == "Seafood Bag"
+        assert seafood_profile["median_primary_delay_seconds"] == 48.0
+
+        assert refrig_profile["bag_name"] == "Refrigerated Grocery Bag"
+        assert refrig_profile["median_primary_delay_seconds"] == 26.0
+
+        # Adaptive lead adjustments must be bag-specific
+        assert tracker.get_adaptive_lead_seconds("wf_meat") == 23.0
+        assert tracker.get_adaptive_lead_seconds("wf_seafood") == 18.0  # adjusted for 48s delay
+        assert tracker.get_adaptive_lead_seconds("wf_refrigerated") == 23.0
+
+        # Summary output displays distinct rows for each bag type
+        tracker.display_stats_summary()
+        out = capsys.readouterr().out
+        assert "Meat Bag" in out
+        assert "Seafood Bag" in out
+        assert "Refrigerated Grocery B" in out
+
+

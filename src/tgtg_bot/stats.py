@@ -1,7 +1,9 @@
 """Persistent drop statistics tracker and adaptive timer analytics for Too Good To Go.
 
 Tracks scheduled vs. actual drop release times, queue delays, and 5-minute
-cart abandonment re-drop intervals per store to adapt polling schedules.
+cart abandonment re-drop intervals strictly per item/bag type (using unique item_id).
+Ensures that different bag types from the same retailer (e.g. Whole Foods Meat Bag vs.
+Bakery Bag vs. Refrigerated Bag) maintain distinct, non-overlapping drop profiles.
 """
 
 from __future__ import annotations
@@ -61,8 +63,9 @@ class DropStatsTracker:
         sold_out_time: float | None = None,
         secured: bool = False,
         quantity_available: int = 1,
+        bag_name: str = "",
     ) -> dict[str, Any]:
-        """Record an observed drop event and recalculate store metrics."""
+        """Record an observed drop event and recalculate item/bag type metrics."""
         actual_dt = datetime.datetime.fromtimestamp(actual_stock_time, tz=datetime.timezone.utc).astimezone()
 
         delay_seconds: float | None = None
@@ -73,9 +76,12 @@ class DropStatsTracker:
         if event_type == "redrop" and sold_out_time is not None:
             redrop_delta_seconds = round(actual_stock_time - sold_out_time, 2)
 
+        resolved_bag_name = bag_name.strip() or "Surprise Bag"
+
         entry = {
             "item_id": str(item_id),
             "store_name": store_name,
+            "bag_name": resolved_bag_name,
             "event_type": event_type,
             "timestamp": actual_dt.isoformat(),
             "scheduled_drop_time": scheduled_drop_time.isoformat() if scheduled_drop_time else None,
@@ -87,12 +93,13 @@ class DropStatsTracker:
 
         self._data["history"].append(entry)
 
-        # Update store aggregate profile
+        # Update item/bag aggregate profile (strictly keyed by item_id)
         store_key = str(item_id)
         store_entry = self._data["stores"].setdefault(
             store_key,
             {
                 "store_name": store_name,
+                "bag_name": resolved_bag_name,
                 "primary_drops_observed": 0,
                 "redrops_observed": 0,
                 "primary_delays": [],
@@ -105,6 +112,11 @@ class DropStatsTracker:
         )
 
         store_entry["store_name"] = store_name
+        if bag_name.strip():
+            store_entry["bag_name"] = bag_name.strip()
+        elif "bag_name" not in store_entry:
+            store_entry["bag_name"] = resolved_bag_name
+
         store_entry["last_seen"] = actual_dt.isoformat()
 
         if event_type == "primary":
@@ -129,8 +141,9 @@ class DropStatsTracker:
         sold_out_time: float,
         scheduled_drop_time: datetime.datetime | None = None,
         had_seen_stock: bool = False,
+        bag_name: str = "",
     ) -> dict[str, Any]:
-        """Record an observed sold-out event at or after drop time.
+        """Record an observed sold-out event at or after drop time for a specific bag type.
 
         Provides vital timing bounds on when the drop occurred and how fast it was claimed,
         even if the user/bot did not secure the bag.
@@ -141,9 +154,12 @@ class DropStatsTracker:
         if scheduled_drop_time is not None:
             delay_seconds = round((sold_dt - scheduled_drop_time).total_seconds(), 2)
 
+        resolved_bag_name = bag_name.strip() or "Surprise Bag"
+
         entry = {
             "item_id": str(item_id),
             "store_name": store_name,
+            "bag_name": resolved_bag_name,
             "event_type": "sold_out",
             "timestamp": sold_dt.isoformat(),
             "scheduled_drop_time": scheduled_drop_time.isoformat() if scheduled_drop_time else None,
@@ -159,6 +175,7 @@ class DropStatsTracker:
             store_key,
             {
                 "store_name": store_name,
+                "bag_name": resolved_bag_name,
                 "primary_drops_observed": 0,
                 "sold_outs_observed": 0,
                 "redrops_observed": 0,
@@ -174,6 +191,11 @@ class DropStatsTracker:
         )
 
         store_entry["store_name"] = store_name
+        if bag_name.strip():
+            store_entry["bag_name"] = bag_name.strip()
+        elif "bag_name" not in store_entry:
+            store_entry["bag_name"] = resolved_bag_name
+
         store_entry["last_seen"] = sold_dt.isoformat()
         store_entry["sold_outs_observed"] = store_entry.get("sold_outs_observed", 0) + 1
         store_entry.setdefault("sold_out_delays", [])
@@ -185,18 +207,22 @@ class DropStatsTracker:
         self._save()
         return entry
 
-    def get_store_profile(self, item_id: str) -> dict[str, Any] | None:
-        """Retrieve aggregated drop metrics for a store/item."""
+    def get_item_profile(self, item_id: str) -> dict[str, Any] | None:
+        """Retrieve aggregated drop metrics for a specific item / bag type."""
         return self._data["stores"].get(str(item_id))
 
+    def get_store_profile(self, item_id: str) -> dict[str, Any] | None:
+        """Retrieve aggregated drop metrics for an item (backwards-compatible alias for get_item_profile)."""
+        return self.get_item_profile(item_id)
+
     def get_all_profiles(self) -> dict[str, Any]:
-        """Retrieve all store profiles."""
+        """Retrieve all item profiles."""
         return self._data.get("stores", {})
 
     def get_adaptive_lead_seconds(self, item_id: str, default: float = 23.0) -> float:
         """Calculate adaptive lead seconds before an event based on past observations.
 
-        If sufficient history exists, adjusts lead timing around the store's median drop delay
+        If sufficient history exists, adjusts lead timing around the item's median drop delay
         or median sold-out delay. Otherwise falls back to the default (e.g. 23s).
         """
         profile = self.get_store_profile(item_id)
@@ -216,26 +242,27 @@ class DropStatsTracker:
         return default
 
     def display_stats_summary(self) -> None:
-        """Print a summary table of tracked store drop latencies."""
+        """Print a summary table of tracked drop latencies per store and bag type."""
         stores = self._data.get("stores", {})
         if not stores:
             print("\n📊 No historical drop statistics recorded yet.")
             return
 
-        print("\n" + "=" * 80)
-        print("📊 HISTORICAL DROP LATENCY & RE-DROP STATISTICS")
-        print("=" * 80)
-        print(f"{'Store Name':<26} | {'Drops':<5} | {'Drop Delay':<11} | {'Sold-Out (Est)':<14} | {'Re-drops':<8} | {'Median Re-drop'}")
-        print("-" * 80)
+        print("\n" + "=" * 105)
+        print("📊 HISTORICAL DROP LATENCY & RE-DROP STATISTICS (PER ITEM / BAG TYPE)")
+        print("=" * 105)
+        print(f"{'Store Name':<28} | {'Bag / Item Type':<24} | {'Drops':<5} | {'Drop Delay':<11} | {'Sold-Out (Est)':<14} | {'Re-drops':<8} | {'Median Re-drop'}")
+        print("-" * 105)
         for _, s in stores.items():
-            name = (s.get("store_name") or "Unknown")[:24]
+            name = (s.get("store_name") or "Unknown")[:26]
+            bag = (s.get("bag_name") or "Surprise Bag")[:22]
             p_count = s.get("primary_drops_observed", 0)
             med_delay = f"+{s['median_primary_delay_seconds']}s" if s.get("median_primary_delay_seconds") is not None else "N/A"
             sold_out_delay = f"+{s['median_sold_out_delay_seconds']}s" if s.get("median_sold_out_delay_seconds") is not None else "N/A"
             r_count = s.get("redrops_observed", 0)
             med_redrop = f"{s['median_redrop_delta_seconds']}s" if s.get("median_redrop_delta_seconds") is not None else "N/A"
-            print(f"{name:<26} | {p_count:<5} | {med_delay:<11} | {sold_out_delay:<14} | {r_count:<8} | {med_redrop}")
-        print("=" * 80)
+            print(f"{name:<28} | {bag:<24} | {p_count:<5} | {med_delay:<11} | {sold_out_delay:<14} | {r_count:<8} | {med_redrop}")
+        print("=" * 105)
 
 
 # Global singleton instance

@@ -406,7 +406,7 @@ def snipe_item(
                 phase = "redrop_surge"
         elif phase == "redrop_surge":
             if now > redrop_target_time + redrop_burst_seconds:
-                print(f"⏳ 5-minute re-drop window elapsed for {info['store_name']}. Bag was finalized by original buyer.")
+                print(f"⏳ 5-minute re-drop window elapsed for {info['store_name']} ({info.get('display_name', 'Surprise Bag')}). Bag was finalized by original buyer.")
                 return False
 
         # Phase transition announcements
@@ -414,12 +414,12 @@ def snipe_item(
             announced_phases.add(phase)
             if phase == "cart_lock_rest":
                 time_until = int(max(0, redrop_target_time - now))
-                print(f"\n⏳ Primary drop window ended for {info['store_name']}. Bag was claimed/sold out.")
+                print(f"\n⏳ Primary drop window ended for {info['store_name']} ({info.get('display_name', 'Surprise Bag')}). Bag was claimed/sold out.")
                 print(f"💤 Entering cart-lock resting phase (heartbeat ~{heartbeat_poll_interval}s) to conserve API budget.")
                 print(f"🎯 Will surge at 5-minute checkout timeout mark in {time_until}s...")
             elif phase == "redrop_surge":
                 print(f"\n⚡ Approaching 5-minute checkout timeout mark (re-drop window active)!")
-                print(f"🚀 Entering ultra-burst sniper mode for {info['store_name']}...")
+                print(f"🚀 Entering ultra-burst sniper mode for {info['store_name']} ({info.get('display_name', 'Surprise Bag')})...")
                 if auto_buy:
                     try:
                         from tgtg_bot.adb_buyer import prewarm_target
@@ -460,6 +460,7 @@ def snipe_item(
                 get_drop_tracker().record_drop(
                     item_id=item_id,
                     store_name=info.get("store_name", "Store"),
+                    bag_name=info.get("display_name", "Surprise Bag"),
                     actual_stock_time=now,
                     scheduled_drop_time=drop_time,
                     event_type="primary" if phase == "primary" else "redrop",
@@ -494,6 +495,7 @@ def snipe_item(
                     get_drop_tracker().record_sold_out(
                         item_id=item_id,
                         store_name=info.get("store_name", "Store"),
+                        bag_name=info.get("display_name", "Surprise Bag"),
                         sold_out_time=now,
                         scheduled_drop_time=drop_time,
                         had_seen_stock=had_seen_stock,
@@ -738,7 +740,7 @@ def _run_daily_sniper_loop(
                     target["redrop_target_time"] = sold_time + 300.0
                     pending_redrop.append(target)
                     time_until_rd = int(target["redrop_target_time"] - time.time())
-                    print(f"📌 Store '{info['store_name']}' queued for 5-min cart re-check in ~{time_until_rd}s.")
+                    print(f"📌 Store '{info['store_name']} ({info.get('display_name', 'Surprise Bag')})' queued for 5-min cart re-check in ~{time_until_rd}s.")
 
             continue
 
@@ -754,15 +756,16 @@ def _run_daily_sniper_loop(
                 target = pending_redrop.pop(0)
                 info = target["info"]
                 item_id = target["item_id"]
-                print(f"\n⚡ Precedence switch: Checking queued 5-minute re-drop for {info['store_name']} immediately...")
+                print(f"\n⚡ Precedence switch: Checking queued 5-minute re-drop for {info['store_name']} ({info.get('display_name', 'Surprise Bag')}) immediately...")
                 stock = check_item_stock(client, item_id)
                 if stock and stock > 0:
-                    print(f"🎉 Deferred re-drop in stock for {info['store_name']}! Securing bag...")
+                    print(f"🎉 Deferred re-drop in stock for {info['store_name']} ({info.get('display_name', 'Surprise Bag')})! Securing bag...")
                     success, _ = secure_bag(client, target, auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids)
                     try:
                         get_drop_tracker().record_drop(
                             item_id=item_id,
                             store_name=info.get("store_name", "Store"),
+                            bag_name=info.get("display_name", "Surprise Bag"),
                             actual_stock_time=time.time(),
                             scheduled_drop_time=target.get("drop_time"),
                             event_type="redrop",
@@ -777,7 +780,7 @@ def _run_daily_sniper_loop(
                         if goal_met:
                             return True
                 else:
-                    print(f"⏳ Deferred re-drop check for {info['store_name']} showed no stock.")
+                    print(f"⏳ Deferred re-drop check for {info['store_name']} ({info.get('display_name', 'Surprise Bag')}) showed no stock.")
                 continue
 
             # Case B: Re-drop is due right now (within ~23 seconds of its 5-minute mark)
