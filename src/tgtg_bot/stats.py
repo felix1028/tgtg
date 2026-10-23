@@ -61,6 +61,7 @@ class DropStatsTracker:
         sold_out_time: float | None = None,
         secured: bool = False,
         quantity_available: int = 1,
+        order_id: str | None = None,
     ) -> dict[str, Any]:
         """Record an observed drop event and recalculate store metrics."""
         actual_dt = datetime.datetime.fromtimestamp(actual_stock_time, tz=datetime.timezone.utc).astimezone()
@@ -83,6 +84,7 @@ class DropStatsTracker:
             "redrop_delta_seconds": redrop_delta_seconds,
             "secured": secured,
             "quantity_available": quantity_available,
+            "order_id": order_id,
         }
 
         self._data["history"].append(entry)
@@ -248,3 +250,69 @@ def get_drop_tracker(stats_file: Path | str = DEFAULT_STATS_FILE) -> DropStatsTr
     if _tracker_instance is None or _tracker_instance.stats_file != Path(stats_file):
         _tracker_instance = DropStatsTracker(stats_file)
     return _tracker_instance
+
+
+def seed_from_active_orders(client: Any, tracker: DropStatsTracker | None = None) -> int:
+    """Inspect active orders from TGTG account and backfill real drop statistics."""
+    if tracker is None:
+        tracker = get_drop_tracker()
+
+    try:
+        active = client.get_active()
+        orders = active.get("orders", []) if isinstance(active, dict) else []
+        seeded = 0
+
+        # Existing order IDs to prevent duplicate entries
+        existing_order_ids = {
+            h.get("order_id") for h in tracker._data.get("history", []) if h.get("order_id")
+        }
+
+        for o in orders:
+            order_id = str(o.get("order_id", ""))
+            item_id = str(o.get("item_id", ""))
+            store_name = o.get("store_name", "Store")
+            purchase_str = o.get("time_of_purchase")
+
+            if not purchase_str or not item_id or (order_id and order_id in existing_order_ids):
+                continue
+
+            try:
+                from tgtg_bot.items import parse_iso_datetime
+                purchase_dt = parse_iso_datetime(purchase_str)
+                if not purchase_dt:
+                    continue
+
+                sched_dt = None
+                try:
+                    item_detail = client.get_item(item_id)
+                    sched_str = item_detail.get("next_sales_window_purchase_start")
+                    if sched_str:
+                        raw_sched = parse_iso_datetime(sched_str)
+                        if raw_sched:
+                            sched_dt = purchase_dt.replace(
+                                hour=raw_sched.hour,
+                                minute=raw_sched.minute,
+                                second=raw_sched.second,
+                                microsecond=raw_sched.microsecond,
+                            )
+                except Exception:
+                    pass
+
+                tracker.record_drop(
+                    item_id=item_id,
+                    store_name=store_name,
+                    actual_stock_time=purchase_dt.timestamp(),
+                    scheduled_drop_time=sched_dt,
+                    event_type="primary",
+                    secured=True,
+                    quantity_available=o.get("quantity", 1),
+                    order_id=order_id,
+                )
+                seeded += 1
+            except Exception:
+                pass
+
+        return seeded
+    except Exception as exc:
+        print(f"⚠️ Failed to inspect active orders for drop statistics: {exc}")
+        return 0
