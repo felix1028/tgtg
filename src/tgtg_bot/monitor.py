@@ -1,18 +1,36 @@
+"""Too Good To Go Store Monitor & Alert Module.
+
+Workflow:
+1. Loads persistent session tokens from tokens.json (auto-refreshing).
+2. Queries the user's saved favorite stores (default) or scans nearby area (--nearby).
+3. Formats item details, pricing (minor units -> currency), and availability.
+4. If bags are in stock and WhatsApp credentials exist in .env, sends instant alerts.
+"""
+
+import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 from dotenv import load_dotenv
 from tgtg import TgtgClient
 
+from tgtg_bot.auth import MATCHING_USER_AGENT
+from tgtg_bot.items import format_item
+import tgtg_bot.notifier as notifier
+
 load_dotenv()
 
 TOKENS_FILE = Path("tokens.json")
-MATCHING_USER_AGENT = "TGTG/26.9.11 Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7 Pro Build/UP1A.231005.007)"
+
 
 class PersistentTgtgClient(TgtgClient):
-    """TgtgClient subclass that automatically persists refreshed tokens and cookies to disk."""
+    """TgtgClient subclass that automatically persists refreshed tokens to disk.
+
+    When Too Good To Go rotates the access token during normal API usage,
+    this class intercepts _refresh_token() and writes the updated tokens
+    back to tokens.json so subsequent bot runs stay authenticated.
+    """
 
     def __init__(self, *args, tokens_path: Path | str = TOKENS_FILE, **kwargs):
         super().__init__(*args, **kwargs)
@@ -38,7 +56,9 @@ class PersistentTgtgClient(TgtgClient):
         super()._refresh_token()
         self.save_tokens()
 
+
 def get_client(tokens_path: Path | str = TOKENS_FILE) -> PersistentTgtgClient:
+    """Create a PersistentTgtgClient using tokens.json or environment variables."""
     tokens_file = Path(tokens_path)
     if tokens_file.exists():
         with open(tokens_file, "r") as f:
@@ -62,49 +82,31 @@ def get_client(tokens_path: Path | str = TOKENS_FILE) -> PersistentTgtgClient:
         print("Error: Not authenticated yet. Run: uv run python -m tgtg_bot.auth")
         sys.exit(1)
 
-def format_item(item: dict) -> dict:
-    display_name = item.get("display_name", "Unknown Item")
-    store_name = item.get("store", {}).get("store_name", "Unknown Store")
-    items_available = item.get("items_available", 0)
-    price_info = (
-        item.get("item", {}).get("item_price")
-        or item.get("item", {}).get("price_including_taxes")
-        or {}
-    )
-    decimals = price_info.get("decimals", 2)
-    minor_units = price_info.get("minor_units", 0)
-    code = price_info.get("code", "")
-    price = f"{minor_units / (10 ** decimals):.2f} {code}".strip()
-    status = f"✅ AVAILABLE: {items_available}" if items_available > 0 else "❌ SOLD OUT"
-    return {
-        "store_name": store_name,
-        "display_name": display_name,
-        "items_available": items_available,
-        "price": price,
-        "status": status,
-        "is_available": items_available > 0,
-    }
 
-def check_favorites(client: TgtgClient):
-    items = client.get_items()
-    print(f"\nFound {len(items)} favorite item(s):")
+def _print_and_filter_available(items: list[dict]) -> list[dict]:
+    """Print formatted item status lines and return only items with stock available."""
     available_items = []
-    
     for item in items:
         info = format_item(item)
-        print(f"- [{info['status']}] {info['store_name']} - {info['display_name']} ({info['price']})")
-        
+        rating_str = f" | {info['rating']}" if info.get("rating") else ""
+        pickup_str = f" | 🧺 {info['pickup_time']}" if info.get("pickup_time") else ""
+        print(f"- [{info['status']}] {info['store_name']} - {info['display_name']} ({info['price']}){rating_str}{pickup_str}")
         if info["is_available"]:
             available_items.append(item)
-            
     return available_items
 
-import argparse
+
+def check_favorites(client: TgtgClient) -> list[dict]:
+    """Scan all favorite stores saved in the user's account and report stock."""
+    items = client.get_items(page_size=100)
+    print(f"\nFound {len(items)} favorite item(s):")
+    return _print_and_filter_available(items)
+
 
 def get_coordinates_from_favorites(client: TgtgClient) -> tuple[float, float] | None:
-    """Derive search coordinates from the user's favorite stores."""
+    """Derive search coordinates from the user's first favorite store with GPS."""
     try:
-        items = client.get_items()
+        items = client.get_items(page_size=100)
         for item in items:
             loc = item.get("pickup_location", {}).get("location")
             if loc and loc.get("latitude") and loc.get("longitude"):
@@ -113,8 +115,9 @@ def get_coordinates_from_favorites(client: TgtgClient) -> tuple[float, float] | 
         pass
     return None
 
-def check_nearby(client: TgtgClient, latitude: float, longitude: float, radius: int = 10):
-    """Scan all nearby stores for bags in stock."""
+
+def check_nearby(client: TgtgClient, latitude: float, longitude: float, radius: int = 10) -> list[dict]:
+    """Scan all nearby stores within a radius for bags currently in stock."""
     print(f"\nScanning stores within {radius}km of ({latitude:.4f}, {longitude:.4f}) with stock available...")
     items = client.get_items(
         latitude=latitude,
@@ -122,17 +125,14 @@ def check_nearby(client: TgtgClient, latitude: float, longitude: float, radius: 
         radius=radius,
         favorites_only=False,
         with_stock_only=True,
+        page_size=100,
     )
     print(f"\nFound {len(items)} nearby item(s) in stock:")
-    available_items = []
-    for item in items:
-        info = format_item(item)
-        print(f"- [{info['status']}] {info['store_name']} - {info['display_name']} ({info['price']})")
-        if info["is_available"]:
-            available_items.append(item)
-    return available_items
+    return _print_and_filter_available(items)
+
 
 def main(args=None):
+    """CLI entrypoint for TGTG monitor."""
     parser = argparse.ArgumentParser(description="Too Good To Go Monitor & WhatsApp Alerts")
     parser.add_argument(
         "--nearby",
@@ -147,7 +147,7 @@ def main(args=None):
     )
     parser.add_argument("--lat", type=float, default=None, help="Latitude for nearby scan")
     parser.add_argument("--lon", type=float, default=None, help="Longitude for nearby scan")
-    
+
     parsed_args = parser.parse_args(args)
     client = get_client()
 
@@ -167,10 +167,10 @@ def main(args=None):
         available_items = check_favorites(client)
 
     if available_items:
-        from tgtg_bot.notifier import notify_available_items
-        notify_available_items(available_items)
+        notifier.notify_available_items(available_items)
     else:
         print("\nNo bags currently available.")
+
 
 if __name__ == "__main__":
     main()

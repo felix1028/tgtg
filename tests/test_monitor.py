@@ -1,3 +1,4 @@
+import datetime
 import json
 import pytest
 from unittest.mock import MagicMock, patch
@@ -44,6 +45,47 @@ class TestFormatItem:
         }
         info = format_item(item)
         assert info["price"] == "500.00 JPY"
+
+    def test_rating_formatting_with_full_dict(self):
+        item = {
+            "items_available": 1,
+            "item": {
+                "average_overall_rating": {
+                    "average_overall_rating": 4.689655172413793,
+                    "rating_count": 29,
+                    "month_count": 6,
+                }
+            }
+        }
+        info = format_item(item)
+        assert info["rating"] == "⭐ 4.7 (29)"
+        assert pytest.approx(info["rating_score"], 0.01) == 4.69
+        assert info["rating_count"] == 29
+
+    def test_rating_formatting_without_count(self):
+        item = {
+            "items_available": 1,
+            "average_overall_rating": 4.5,
+        }
+        info = format_item(item)
+        assert info["rating"] == "⭐ 4.5"
+        assert info["rating_score"] == 4.5
+        assert info["rating_count"] is None
+
+    def test_rating_formatting_empty_or_zero(self):
+        item = {
+            "items_available": 1,
+            "item": {
+                "average_overall_rating": {
+                    "average_overall_rating": 0,
+                    "rating_count": 0,
+                }
+            }
+        }
+        info = format_item(item)
+        assert info["rating"] == ""
+        assert info["rating_score"] is None
+        assert info["rating_count"] is None
 
 
 class TestCheckFavorites:
@@ -169,6 +211,7 @@ class TestCheckNearby:
             radius=15,
             favorites_only=False,
             with_stock_only=True,
+            page_size=100,
         )
 
 
@@ -188,3 +231,75 @@ class TestGetCoordinatesFromFavorites:
         mock_client.get_items.return_value = [{"store": {}}]
         coords = get_coordinates_from_favorites(mock_client)
         assert coords is None
+
+
+class TestFormatPickupInterval:
+    def test_same_day_interval(self):
+        from tgtg_bot.items import format_pickup_interval
+        now = datetime.datetime(2026, 10, 12, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+        start_dt = now.replace(hour=18, minute=0, second=0)
+        end_dt = now.replace(hour=19, minute=30, second=0)
+        interval = {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        }
+        formatted = format_pickup_interval(interval, now=now)
+        assert formatted == "Today 6:00 PM - 7:30 PM"
+
+    def test_tomorrow_interval(self):
+        from tgtg_bot.items import format_pickup_interval
+        now = datetime.datetime(2026, 10, 12, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+        tomorrow = now + datetime.timedelta(days=1)
+        start_dt = tomorrow.replace(hour=9, minute=0, second=0)
+        end_dt = tomorrow.replace(hour=10, minute=0, second=0)
+        interval = {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        }
+        formatted = format_pickup_interval(interval, now=now)
+        assert formatted == "Tomorrow 9:00 AM - 10:00 AM"
+
+    def test_future_date_interval(self):
+        from tgtg_bot.items import format_pickup_interval
+        now = datetime.datetime(2026, 10, 12, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+        future = now + datetime.timedelta(days=3)
+        start_dt = future.replace(hour=14, minute=0, second=0)
+        end_dt = future.replace(hour=15, minute=0, second=0)
+        interval = {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        }
+        formatted = format_pickup_interval(interval, now=now)
+        assert "Oct 15 2:00 PM - 3:00 PM" in formatted
+
+    def test_only_start_or_only_end(self):
+        from tgtg_bot.items import format_pickup_interval
+        now = datetime.datetime(2026, 10, 12, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+        start_dt = now.replace(hour=20, minute=0, second=0)
+        end_dt = now.replace(hour=21, minute=0, second=0)
+
+        assert format_pickup_interval({"start": start_dt.isoformat()}, now=now) == "Today from 8:00 PM"
+        assert format_pickup_interval({"end": end_dt.isoformat()}, now=now) == "Today until 9:00 PM"
+
+    def test_empty_and_none_interval(self):
+        from tgtg_bot.items import format_pickup_interval
+        assert format_pickup_interval(None) == ""
+        assert format_pickup_interval({}) == ""
+        assert format_pickup_interval({"start": None, "end": None}) == ""
+        assert format_pickup_interval({"start": "invalid_date"}) == ""
+
+    def test_format_item_includes_pickup_time(self):
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        start_dt = now.replace(hour=17, minute=0, second=0)
+        end_dt = now.replace(hour=18, minute=0, second=0)
+        item = {
+            "display_name": "Bakery Bag",
+            "items_available": 1,
+            "pickup_interval": {
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+            },
+        }
+        info = format_item(item)
+        assert "pickup_time" in info
+        assert "Today 5:00 PM - 6:00 PM" in info["pickup_time"]

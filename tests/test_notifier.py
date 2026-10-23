@@ -32,6 +32,14 @@ class TestFormatNotificationMessage:
     def test_empty_list(self):
         assert format_notification_message([]) == ""
 
+    def test_item_with_pickup_time(self, sample_available_item):
+        sample_available_item["pickup_interval"] = {
+            "start": "2026-10-12T20:00:00Z",
+            "end": "2026-10-12T21:00:00Z",
+        }
+        msg = format_notification_message([sample_available_item])
+        assert "Pickup: 🧺" in msg
+
 
 class TestSendWhatsappMessage:
     @patch("tgtg_bot.notifier.requests.get")
@@ -120,7 +128,6 @@ class TestNotifyAvailableItems:
     def test_notify_skipped_when_credentials_missing(self, monkeypatch, sample_available_item, capsys):
         monkeypatch.delenv("WHATSAPP_PHONE", raising=False)
         monkeypatch.delenv("WHATSAPP_APIKEY", raising=False)
-        monkeypatch.delenv("CALLMEBOT_API_KEY", raising=False)
 
         result = notify_available_items([sample_available_item])
         assert result is False

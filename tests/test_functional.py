@@ -6,8 +6,10 @@ def test_monitor_main_flow(capsys, sample_available_item, sample_sold_out_item):
     mock_client = MagicMock()
     mock_client.get_items.return_value = [sample_available_item, sample_sold_out_item]
 
-    with patch("tgtg_bot.monitor.get_client", return_value=mock_client):
-        main()
+    with patch("tgtg_bot.monitor.get_client", return_value=mock_client), \
+         patch("tgtg_bot.notifier.notify_available_items") as mock_notify:
+        main(args=[])
+        mock_notify.assert_called_once()
 
     captured = capsys.readouterr().out
     assert "Checking your favorite stores..." in captured

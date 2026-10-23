@@ -1,4 +1,15 @@
 import pytest
+from unittest.mock import patch, MagicMock
+
+@pytest.fixture(autouse=True)
+def prevent_live_whatsapp_calls():
+    """Ensure no test ever triggers live WhatsApp/CallMeBot HTTP requests."""
+    with patch("tgtg_bot.notifier.requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "OK"
+        mock_get.return_value = mock_resp
+        yield mock_get
 
 @pytest.fixture
 def sample_available_item():
