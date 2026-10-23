@@ -1,4 +1,5 @@
 import datetime
+import time
 import pytest
 from unittest.mock import MagicMock, patch
 from tgtg.exceptions import TgtgAPIError
@@ -592,5 +593,111 @@ class TestSnipeAndRunDaily:
 
         mock_proc.terminate.assert_called_once()
         mock_proc.wait.assert_called_once_with(timeout=2)
+
+    @patch("tgtg_bot.sniper.secure_bag")
+    @patch("tgtg_bot.sniper.snipe_item")
+    def test_run_daily_sniper_primary_drop_precedence(self, mock_snipe, mock_secure):
+        # Target A sells out during its primary drop and gets queued for re-drop.
+        # Target B has an imminent primary drop.
+        # Priority scheduler must run Target B's primary drop before evaluating Target A's re-drop.
+        execution_order = []
+
+        def fake_snipe(client, target, **kwargs):
+            item_id = target["item_id"]
+            execution_order.append(f"primary_{item_id}")
+            if item_id == "target_a":
+                # Fails primary drop -> will be queued for re-drop
+                target["first_sold_out_time"] = time.time()
+                return False
+            elif item_id == "target_b":
+                # Succeeds on primary drop
+                target["last_order"] = {"order_id": "ord_b"}
+                target["last_acquired_quantity"] = 1
+                return True
+            return False
+
+        mock_snipe.side_effect = fake_snipe
+        mock_client = MagicMock()
+        mock_client.get_active.return_value = {"orders": []}
+
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        target_a = {
+            "item_id": "target_a",
+            "info": {"store_name": "Store A", "display_name": "Bag A"},
+            "drop_time": now,
+        }
+        target_b = {
+            "item_id": "target_b",
+            "info": {"store_name": "Store B", "display_name": "Bag B"},
+            "drop_time": now + datetime.timedelta(seconds=2),
+        }
+
+        with patch("time.sleep"):
+            success = run_daily_sniper(
+                mock_client,
+                [target_a, target_b],
+                total_bags_target=1,  # Stop after securing 1 bag (which will be target_b)
+                watch_redrop=True,
+            )
+
+        assert success is True
+        assert execution_order == ["primary_target_a", "primary_target_b"]
+
+    @patch("tgtg_bot.sniper.check_item_stock", return_value=1)
+    @patch("tgtg_bot.sniper.secure_bag", return_value=(True, "purchased"))
+    @patch("tgtg_bot.sniper.snipe_item")
+    def test_run_daily_sniper_deferred_redrop_immediate_check(self, mock_snipe, mock_secure, mock_stock):
+        # Target A fails primary drop.
+        # Target B runs primary drop and finishes AFTER Target A's 5-minute re-drop mark has elapsed.
+        # The scheduler detects Target A's re-drop is deferred and immediately checks stock and secures it.
+        mock_client = MagicMock()
+        mock_client.get_active.return_value = {"orders": []}
+
+        def fake_secure(client, target, **kwargs):
+            target["last_order"] = {"order_id": f"ord_{target['item_id']}"}
+            target["last_acquired_quantity"] = 1
+            return True, "purchased"
+
+        mock_secure.side_effect = fake_secure
+
+        def fake_snipe(client, target, **kwargs):
+            item_id = target["item_id"]
+            if item_id == "target_a":
+                # Fails primary drop, 5-minute window queued
+                target["first_sold_out_time"] = time.time() - 350.0  # Already passed 5m
+                target["redrop_target_time"] = target["first_sold_out_time"] + 300.0  # -50s ago
+                return False
+            elif item_id == "target_b":
+                # Target B also fails primary drop
+                return False
+            return False
+
+        mock_snipe.side_effect = fake_snipe
+
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        target_a = {
+            "item_id": "target_a",
+            "info": {"store_name": "Store A", "display_name": "Bag A"},
+            "drop_time": now,
+        }
+        target_b = {
+            "item_id": "target_b",
+            "info": {"store_name": "Store B", "display_name": "Bag B"},
+            "drop_time": now + datetime.timedelta(seconds=1),
+        }
+
+        with patch("time.sleep"):
+            success = run_daily_sniper(
+                mock_client,
+                [target_a, target_b],
+                total_bags_target=1,
+                watch_redrop=True,
+            )
+
+        assert success is True
+        mock_stock.assert_called_with(mock_client, "target_a")
+        mock_secure.assert_called_once()
+        assert mock_secure.call_args[0][1]["item_id"] == "target_a"
+
 
 

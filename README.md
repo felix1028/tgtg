@@ -379,17 +379,23 @@ The bot will:
         Pickup: 🧺 Today 3:30 PM - 4:00 PM
         Status: ❌ Sold out | 🕒 Drops at 03:00 PM
    ```
-3. Enter your choices (up to 3 stores across locations/types, 1 bag per store):
-   * `1, 2, 3`
-4. The sniper organizes targets **chronologically**, sleeps with 0% CPU until 15 seconds before drop time, engages macOS sleep prevention (`caffeinate`), pre-warms the app in the emulator, executes the 3-phase adaptive polling, enters your CVV, and confirms payment.
-5. Sends an instant WhatsApp notification confirming the order!
+3. Enter your choices (select any number of stores across locations/types, or type `all` — strictly 1 bag per store):
+   * `1, 2, 4` or `all`
+4. **Priority-Driven Scheduling & Precedence:**
+   * The sniper orders all targets **chronologically** by scheduled drop time.
+   * If a store drops but the bag is not secured (e.g. instant sell-out), it is automatically queued for a **5-minute cart abandonment re-check**.
+   * **Primary Drop Precedence:** If another store has a scheduled primary drop at or around that time, the primary drop takes absolute priority.
+   * **Deferred Re-checks:** As soon as the primary drop concludes (or if it took longer than expected), the sniper immediately checks the deferred re-check store so no released carts are missed.
+5. The sniper sleeps with 0% CPU until 15 seconds before drop time, engages macOS sleep prevention (`caffeinate`), pre-warms the app in the emulator, executes the 3-phase adaptive polling, enters your CVV, and confirms payment.
+6. Sends an instant WhatsApp notification confirming the order!
 
 #### Skip the Prompt (CLI Flags):
 ```bash
-# Target stores 1, 2, and 3 (1 bag per store):
-uv run python -m tgtg_bot.sniper --top 1,2,3
+# Target stores 1, 2, and 4 (or 'all'):
+uv run python -m tgtg_bot.sniper --top 1,2,4
+uv run python -m tgtg_bot.sniper --top all
 
-# Disable 5-minute cart abandonment re-drop monitoring (primary drop only):
+# Disable 5-minute cart abandonment re-drop monitoring (primary drops only):
 uv run python -m tgtg_bot.sniper --top 1,2 --no-watch-redrop
 ```
 

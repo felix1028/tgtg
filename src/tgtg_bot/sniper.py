@@ -456,7 +456,9 @@ def snipe_item(
             is_at_or_after_drop = (drop_time is None) or (now_dt >= drop_time)
             if is_at_or_after_drop:
                 first_sold_out_time = now
+                target["first_sold_out_time"] = first_sold_out_time
                 redrop_target_time = first_sold_out_time + redrop_timeout_seconds
+                target["redrop_target_time"] = redrop_target_time
 
         # Compute sleep interval based on current phase
         if phase == "primary":
@@ -594,7 +596,15 @@ def _run_daily_sniper_loop(
     total_bags_target: int | None = None,
     watch_redrop: bool = True,
 ) -> bool:
-    """Internal sniper loop executed under the system sleep prevention lock."""
+    """Internal priority-driven sniper loop.
+
+    Precedence Rule:
+    - Primary drops have absolute priority over pending 5-minute re-checks.
+    - If a primary drop conflicts or occurs while waiting for a re-drop, the primary drop
+      runs first.
+    - Once the primary drop concludes, any pending re-check is immediately evaluated
+      (or checked post-drop if its window elapsed while the primary drop was active).
+    """
     if total_bags_target is None:
         total_bags_target = len(ranked_targets)
 
@@ -603,88 +613,170 @@ def _run_daily_sniper_loop(
 
     print(f"\n🎯 Hunting goal: Procure {total_bags_target} total bag(s) (1 per location/store)")
     if watch_redrop:
-        print("Cart re-drop monitoring: ACTIVE (watching for 5-minute checkout timeouts after sold-out drops)")
+        print("Cart re-drop monitoring: ACTIVE (watching for 5-minute checkout timeouts; primary drops take precedence)")
 
-    for rank, target in enumerate(ranked_targets, 1):
-        if total_secured >= total_bags_target:
+    # pending_primary: targets waiting for primary drop (in chronological order)
+    pending_primary = list(ranked_targets)
+    # pending_redrop: targets that completed primary drop without securing, awaiting 5-min re-check
+    pending_redrop: list[dict] = []
+
+    lead_time = 15.0
+
+    while total_secured < total_bags_target and (pending_primary or pending_redrop):
+        now_ts = time.time()
+        now_dt = datetime.datetime.now(datetime.timezone.utc).astimezone()
+
+        # Check earliest upcoming primary drop
+        next_primary = None
+        seconds_until_primary = float("inf")
+
+        while pending_primary:
+            cand = pending_primary[0]
+            p_dt = cand.get("drop_time")
+            if not p_dt:
+                # Target has no scheduled drop time (check immediately)
+                next_primary = cand
+                seconds_until_primary = 0.0
+                break
+            sec = (p_dt - now_dt).total_seconds()
+            if sec <= -check_window_seconds:
+                print(f"⚠️ Target '{cand['info']['store_name']}' drop window ({cand.get('drop_time_str')}) has already passed. Moving to next target.")
+                pending_primary.pop(0)
+                continue
+            next_primary = cand
+            seconds_until_primary = sec
             break
 
-        remaining_needed = total_bags_target - total_secured
-        desired_qty = 1
-        target["target_quantity"] = 1
+        primary_is_imminent = (next_primary is not None) and (seconds_until_primary <= lead_time)
 
-        info = target["info"]
-        item_id = target["item_id"]
-        drop_time = target["drop_time"]
+        # Precedence Rule 1: Primary drop is imminent (happening now or within lead_time)
+        if primary_is_imminent and pending_primary:
+            target = pending_primary.pop(0)
+            info = target["info"]
+            item_id = target["item_id"]
 
-        print(f"\n{'=' * 55}")
-        print(f"🎯 Evaluating Target #{rank}: {info['store_name']} - {info['display_name']}")
-        print(f"   Quota remaining: {remaining_needed} bag(s)")
-        print(f"{'=' * 55}")
+            print(f"\n{'=' * 55}")
+            print(f"🎯 Evaluating Primary Drop: {info['store_name']} - {info['display_name']}")
+            print(f"   Quota remaining: {total_bags_target - total_secured} bag(s)")
+            print(f"{'=' * 55}")
 
-        # 1. Immediate Check: Already in stock?
-        print("Checking if stock is already available right now...")
-        current_stock = check_item_stock(client, item_id)
-        if current_stock is not None and current_stock > 0:
-            target["info"]["items_available"] = current_stock
-            success, _ = secure_bag(
-                client, target, auto_buy=auto_buy, device_id=device_id,
-                quantity=1, exclude_order_ids=exclude_order_ids,
+            # Sleep remaining seconds until lead_time if needed
+            if seconds_until_primary > 0:
+                sleep_sec = max(0.0, seconds_until_primary)
+                if sleep_sec > lead_time:
+                    pre_sleep = sleep_sec - lead_time
+                    print(f"💤 Sleeping for {int(pre_sleep // 60)}m {int(pre_sleep % 60)}s until drop time...")
+                    time.sleep(pre_sleep)
+
+            if auto_buy:
+                try:
+                    from tgtg_bot.adb_buyer import prewarm_target
+                    print(f"🤖 Pre-warming Android emulator for {info['store_name']} drop...")
+                    prewarm_target(item_id, device_id=device_id)
+                except Exception:
+                    pass
+
+            # Execute primary drop snipe (Phase 1 only, 1 bag)
+            secured = snipe_item(
+                client, target, poll_interval=0.6, max_check_seconds=check_window_seconds,
+                auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids,
+                watch_redrop=False,  # Re-drop scheduling is handled by outer event loop
             )
-            if success:
+
+            if secured:
                 total_secured, goal_met = _record_secured_target(
                     target, total_secured, total_bags_target, exclude_order_ids
                 )
                 if goal_met:
                     return True
+            else:
+                # Store sold out / not captured. Queue for 5-minute re-drop if enabled
+                if watch_redrop:
+                    sold_time = target.get("first_sold_out_time") or time.time()
+                    target["first_sold_out_time"] = sold_time
+                    target["redrop_target_time"] = sold_time + 300.0
+                    pending_redrop.append(target)
+                    time_until_rd = int(target["redrop_target_time"] - time.time())
+                    print(f"📌 Store '{info['store_name']}' queued for 5-min cart re-check in ~{time_until_rd}s.")
+
+            continue
+
+        # Precedence Rule 2: No primary drop is imminent right now.
+        # Check if any pending re-drop is ready or was deferred while a primary drop was running.
+        if pending_redrop:
+            pending_redrop.sort(key=lambda t: t.get("redrop_target_time", 0.0))
+            earliest_redrop = pending_redrop[0]
+            time_until_rd = earliest_redrop["redrop_target_time"] - now_ts
+
+            # Case A: Deferred re-drop (its 5-minute mark passed while the primary drop was running)
+            if time_until_rd < -30.0:
+                target = pending_redrop.pop(0)
+                info = target["info"]
+                item_id = target["item_id"]
+                print(f"\n⚡ Precedence switch: Checking queued 5-minute re-drop for {info['store_name']} immediately...")
+                stock = check_item_stock(client, item_id)
+                if stock and stock > 0:
+                    print(f"🎉 Deferred re-drop in stock for {info['store_name']}! Securing bag...")
+                    success, _ = secure_bag(client, target, auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids)
+                    if success:
+                        total_secured, goal_met = _record_secured_target(target, total_secured, total_bags_target, exclude_order_ids)
+                        if goal_met:
+                            return True
+                else:
+                    print(f"⏳ Deferred re-drop check for {info['store_name']} showed no stock.")
                 continue
 
-        # 2. Check scheduled drop time (allow drops that started within check_window_seconds)
-        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
-        if not drop_time:
-            print(f"⚠️ Target #{rank} has no upcoming drop scheduled today. Moving to next target.")
-            continue
+            # Case B: Re-drop is due right now (within 30 seconds of its 5-minute mark)
+            if time_until_rd <= 30.0:
+                target = pending_redrop.pop(0)
+                info = target["info"]
+                item_id = target["item_id"]
 
-        seconds_until_drop = (drop_time - now).total_seconds()
-        if seconds_until_drop <= -check_window_seconds:
-            print(f"⚠️ Target #{rank} drop window ({target['drop_time_str']}) has already passed. Moving to next target.")
-            continue
+                # Calculate available burst window without encroaching on next primary drop
+                available_window = 60.0
+                if next_primary and (p_dt := next_primary.get("drop_time")):
+                    sec_to_next = (p_dt - datetime.datetime.now(datetime.timezone.utc).astimezone()).total_seconds()
+                    # Leave lead_time for the upcoming primary drop
+                    available_window = max(5.0, min(60.0, sec_to_next - lead_time))
 
-        if seconds_until_drop > 0:
-            print(f"Target #{rank} drops at {target['drop_time_str']} (in {int(seconds_until_drop // 60)}m {int(seconds_until_drop % 60)}s).")
-        else:
-            print(f"⚡ Target #{rank} drop window started {int(-seconds_until_drop)}s ago ({target['drop_time_str']}) — entering sniper immediately!")
+                print(f"\n{'=' * 55}")
+                print(f"🎯 Evaluating 5-Minute Re-Drop Surge: {info['store_name']} - {info['display_name']}")
+                print(f"   Quota remaining: {total_bags_target - total_secured} bag(s) | Surge window: {int(available_window)}s")
+                print(f"{'=' * 55}")
 
-        # Sleep with 0% CPU until 15 seconds before drop
-        lead_time = 15
-        if seconds_until_drop > lead_time:
-            sleep_duration = seconds_until_drop - lead_time
-            print(f"💤 Sleeping for {int(sleep_duration // 60)}m {int(sleep_duration % 60)}s until drop time...")
-            sleep_end = time.time() + sleep_duration
-            while time.time() < sleep_end:
-                time.sleep(min(5, sleep_end - time.time()))
+                if auto_buy:
+                    try:
+                        from tgtg_bot.adb_buyer import prewarm_target
+                        prewarm_target(item_id, device_id=device_id)
+                    except Exception:
+                        pass
 
-        # Pre-warm Android emulator before drop if auto-buy is enabled
-        if auto_buy:
-            from tgtg_bot.adb_buyer import prewarm_target
-            print(f"🤖 Pre-warming Android emulator for {info['store_name']} drop...")
-            prewarm_target(item_id, device_id=device_id)
+                secured = snipe_item(
+                    client, target, poll_interval=0.28, burst_poll_interval=0.28,
+                    max_check_seconds=int(available_window),
+                    auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids,
+                    watch_redrop=False,
+                )
 
-        # 3. Enter high-frequency snipe mode
-        secured = snipe_item(
-            client, target, poll_interval=0.6, max_check_seconds=check_window_seconds,
-            auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids,
-            watch_redrop=watch_redrop,
-        )
-        if secured:
-            total_secured, goal_met = _record_secured_target(
-                target, total_secured, total_bags_target, exclude_order_ids
-            )
-            if goal_met:
-                return True
-            continue
+                if secured:
+                    total_secured, goal_met = _record_secured_target(
+                        target, total_secured, total_bags_target, exclude_order_ids
+                    )
+                    if goal_met:
+                        return True
+                else:
+                    print(f"⏳ 5-minute re-drop window elapsed for {info['store_name']}. No stock captured.")
+                continue
 
-        print("Moving to next target on your priority list...")
+        # Case C: Idle period between upcoming events (neither primary nor re-drop is due right now)
+        earliest_event_sec = seconds_until_primary - lead_time
+        if pending_redrop:
+            rd_sec = pending_redrop[0]["redrop_target_time"] - now_ts - 30.0
+            if rd_sec < earliest_event_sec:
+                earliest_event_sec = rd_sec
+
+        sleep_chunk = max(1.0, min(5.0, earliest_event_sec))
+        time.sleep(sleep_chunk)
 
     if total_secured > 0:
         print(f"\n🏁 Finished evaluating targets. Secured {total_secured}/{total_bags_target} requested bag(s).")
