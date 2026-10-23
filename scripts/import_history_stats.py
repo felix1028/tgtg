@@ -7,6 +7,7 @@ without altering any core application code.
 
 from __future__ import annotations
 
+import argparse
 import datetime
 from pathlib import Path
 from typing import Any
@@ -16,10 +17,15 @@ from tgtg_bot.monitor import get_client
 from tgtg_bot.stats import DropStatsTracker
 
 
-def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
+def import_order_history(stats_file: Path | str = "drop_stats.json", clear: bool = False) -> None:
+    stats_path = Path(stats_file)
+    if clear and stats_path.exists():
+        stats_path.unlink()
+        print(f"🗑️ Cleared existing history from {stats_path}.")
+
     print("Connecting to Too Good To Go API...")
     client = get_client()
-    tracker = DropStatsTracker(stats_file)
+    tracker = DropStatsTracker(stats_path)
 
     print("Fetching complete order history...")
     response = client._post(client._get_url("order/v8"), json={"paging": {"size": 100}})
@@ -82,7 +88,10 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
                 tracker._data["stores"][item_id]["bag_name"] = bag_name
             continue
 
-        sched_time_str = item_detail.get("next_sales_window_purchase_start")
+        sched_time_str = (
+            item_detail.get("next_sales_window_purchase_start")
+            or item_detail.get("item", {}).get("next_sales_window_purchase_start")
+        )
         sched_dt: datetime.datetime | None = None
 
         if sched_time_str:
@@ -127,4 +136,7 @@ def import_order_history(stats_file: Path | str = "drop_stats.json") -> None:
 
 
 if __name__ == "__main__":
-    import_order_history()
+    parser = argparse.ArgumentParser(description="Import historical order data into drop_stats.json")
+    parser.add_argument("--clear", action="store_true", help="Clear existing drop stats history before importing")
+    args = parser.parse_args()
+    import_order_history(clear=args.clear)
