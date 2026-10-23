@@ -149,29 +149,29 @@ def prompt_user_ranking(
     favorites: list[dict],
     user_input: str | None = None,
 ) -> list[dict]:
-    """Prompt user to choose up to 3 favorites to target today (1 bag per store)."""
+    """Prompt user to choose favorites to target today (1 bag per store, no count limit)."""
     if not user_input:
-        user_input = input("Enter up to 3 bags/stores to target today (e.g. 1, 2, 3): ").strip()
+        user_input = input("Enter bags/stores to target today (e.g. 1, 2, 4 or 'all'): ").strip()
 
     if not user_input:
         print("No choices entered. Exiting.")
         sys.exit(0)
 
-    parts = re.split(r"[\s,]+", user_input.strip())
     selected = []
     seen = set()
 
-    for part in parts:
-        match = re.match(r"^(\d+)", part)
-        if match:
-            idx = int(match.group(1)) - 1
-            if 0 <= idx < len(favorites) and idx not in seen:
-                target = dict(favorites[idx])
-                target["target_quantity"] = 1
-                selected.append(target)
-                seen.add(idx)
-                if len(selected) == 3:
-                    break
+    if user_input.strip().lower() == "all":
+        for fav in favorites:
+            selected.append(dict(fav))
+    else:
+        parts = re.split(r"[\s,]+", user_input.strip())
+        for part in parts:
+            match = re.match(r"^(\d+)", part)
+            if match:
+                idx = int(match.group(1)) - 1
+                if 0 <= idx < len(favorites) and idx not in seen:
+                    selected.append(dict(favorites[idx]))
+                    seen.add(idx)
 
     if not selected:
         print("Invalid selection. Exiting.")
@@ -502,18 +502,17 @@ def _get_initial_active_order_ids(client: TgtgClient) -> set[str]:
 
 def _record_secured_target(
     target: dict,
-    desired_qty: int,
     total_secured: int,
     total_bags_target: int,
     exclude_order_ids: set[str],
 ) -> tuple[int, bool]:
-    """Record purchased order ID, update total secured count, and check goal."""
+    """Record purchased order ID, increment total secured count, and check goal."""
     order = target.get("last_order")
     if order and "order_id" in order:
         exclude_order_ids.add(str(order["order_id"]))
-    qty_bought = target.get("last_acquired_quantity", desired_qty)
-    new_total = total_secured + qty_bought
-    print(f"\n🎉 Secured {qty_bought} bag(s)! Total procured so far: {new_total}/{total_bags_target}")
+    new_total = total_secured + 1
+    store = target.get("info", {}).get("store_name", "Target")
+    print(f"\n🎉 Secured bag from {store}! Total procured so far: {new_total}/{total_bags_target}")
 
     if new_total >= total_bags_target:
         print("\n🎉 Target bag goal achieved! All requested bags procured.")
@@ -634,7 +633,7 @@ def _run_daily_sniper_loop(
             )
             if success:
                 total_secured, goal_met = _record_secured_target(
-                    target, 1, total_secured, total_bags_target, exclude_order_ids
+                    target, total_secured, total_bags_target, exclude_order_ids
                 )
                 if goal_met:
                     return True
@@ -679,7 +678,7 @@ def _run_daily_sniper_loop(
         )
         if secured:
             total_secured, goal_met = _record_secured_target(
-                target, 1, total_secured, total_bags_target, exclude_order_ids
+                target, total_secured, total_bags_target, exclude_order_ids
             )
             if goal_met:
                 return True

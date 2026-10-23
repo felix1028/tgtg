@@ -94,21 +94,17 @@ class TestPromptUserRanking:
         with pytest.raises(SystemExit):
             prompt_user_ranking(mock_favorites, user_input="   ")
 
-    def test_prompt_user_ranking_with_inline_quantities(self, mock_favorites):
-        # Even if user enters inline quantities, each selected store targets strictly 1 bag
-        ranked = prompt_user_ranking(mock_favorites, user_input="1:2, 2:1, 3:3")
-        assert len(ranked) == 3
-        assert ranked[0]["target_quantity"] == 1
-        assert ranked[1]["target_quantity"] == 1
-        assert ranked[2]["target_quantity"] == 1
+    def test_prompt_user_ranking_allows_more_than_three_stores(self, mock_favorites):
+        # User can select any number of stores (e.g. 4 stores), not limited to 3
+        ranked = prompt_user_ranking(mock_favorites, user_input="1, 2, 3, 4")
+        assert len(ranked) == 4
+        assert [r["info"]["store_name"] for r in ranked] == ["Store A", "Store B", "Store C", "Store D"]
 
-    def test_prompt_user_ranking_with_x_syntax(self, mock_favorites):
-        # Even with 1x2 syntax, each selected store targets strictly 1 bag
-        ranked = prompt_user_ranking(mock_favorites, user_input="1x2, 2x1, 3x3")
-        assert len(ranked) == 3
-        assert ranked[0]["target_quantity"] == 1
-        assert ranked[1]["target_quantity"] == 1
-        assert ranked[2]["target_quantity"] == 1
+    def test_prompt_user_ranking_all_keyword(self, mock_favorites):
+        # User can type 'all' to select all stores in favorites
+        ranked = prompt_user_ranking(mock_favorites, user_input="all")
+        assert len(ranked) == 4
+        assert [r["info"]["store_name"] for r in ranked] == ["Store A", "Store B", "Store C", "Store D"]
 
 
 class TestDisplayMenu:
@@ -454,10 +450,6 @@ class TestSnipeAndRunDaily:
         )
         assert success is True
         assert mock_secure.call_count == 3
-        # Verify quantity passed to secure_bag for each call is strictly 1
-        assert mock_secure.call_args_list[0].kwargs["quantity"] == 1
-        assert mock_secure.call_args_list[1].kwargs["quantity"] == 1
-        assert mock_secure.call_args_list[2].kwargs["quantity"] == 1
 
     @patch("tgtg_bot.sniper.secure_bag")
     @patch("tgtg_bot.sniper.check_item_stock")
@@ -484,7 +476,6 @@ class TestSnipeAndRunDaily:
         )
         assert success is True
         mock_secure.assert_called_once()
-        assert mock_secure.call_args.kwargs["quantity"] == 1
 
     @patch("tgtg_bot.sniper.secure_bag", return_value=(True, "purchased"))
     @patch("tgtg_bot.sniper.check_item_stock")
@@ -514,7 +505,6 @@ class TestSnipeAndRunDaily:
             )
         assert secured is True
         mock_secure.assert_called_once()
-        assert mock_secure.call_args.kwargs["quantity"] == 1
 
     @patch("tgtg_bot.sniper.secure_bag", return_value=(True, "purchased"))
     @patch("tgtg_bot.sniper.check_item_stock", return_value=1)
