@@ -149,14 +149,9 @@ def prompt_user_ranking(
     favorites: list[dict],
     user_input: str | None = None,
 ) -> list[dict]:
-    """Prompt user to choose up to 3 favorites and optional quantities.
-
-    Supports:
-        - Indices only: "1, 2, 3"
-        - Inline quantities: "1:2, 2:1, 3:3" or "1x2, 2x1, 3x3"
-    """
+    """Prompt user to choose up to 3 favorites to target today (1 bag per store)."""
     if not user_input:
-        user_input = input("Enter up to 3 bags to target today (e.g. 1:2, 2:1, 3:3 or 1, 2, 3): ").strip()
+        user_input = input("Enter up to 3 bags/stores to target today (e.g. 1, 2, 3): ").strip()
 
     if not user_input:
         print("No choices entered. Exiting.")
@@ -167,12 +162,12 @@ def prompt_user_ranking(
     seen = set()
 
     for part in parts:
-        match = re.match(r"^(\d+)(?:[:xX*](\d+))?$", part)
+        match = re.match(r"^(\d+)", part)
         if match:
             idx = int(match.group(1)) - 1
             if 0 <= idx < len(favorites) and idx not in seen:
                 target = dict(favorites[idx])
-                target["target_quantity"] = max(1, int(match.group(2))) if match.group(2) else 1
+                target["target_quantity"] = 1
                 selected.append(target)
                 seen.add(idx)
                 if len(selected) == 3:
@@ -191,8 +186,7 @@ def prompt_user_ranking(
         drop_str = target.get("drop_time_str", "No drop time")
         rating_str = f" | {info['rating']}" if info.get("rating") else ""
         pickup_str = f" | 🧺 {info['pickup_time']}" if info.get("pickup_time") else ""
-        qty_str = f" -> Target: {target['target_quantity']} bag(s)"
-        print(f"  #{order}: [{drop_str}] {info['store_name']} - {info['display_name']} ({info['price']}){rating_str}{pickup_str}{qty_str}")
+        print(f"  #{order}: [{drop_str}] {info['store_name']} - {info['display_name']} ({info['price']}){rating_str}{pickup_str}")
 
     # Warn if any selected items have no drop scheduled
     unscheduled = [
@@ -205,8 +199,8 @@ def prompt_user_ranking(
             print(f"  • '{t['info']['store_name']} - {t['info']['display_name']}' has NO scheduled drop today.")
             print("    (It will be checked once upon startup, but cannot be sniped later if sold out).")
 
-    total_goal = sum(t.get("target_quantity", 1) for t in chronological_targets)
-    print(f"\n💡 Total session goal: {total_goal} bag(s). The bot will check drops until targets are secured, alert on WhatsApp, and exit.")
+    total_goal = len(chronological_targets)
+    print(f"\n💡 Total session goal: {total_goal} bag(s) across selected stores (1 per store). The bot will hunt drops until targets are secured, alert on WhatsApp, and exit.")
     return chronological_targets
 
 
@@ -353,8 +347,21 @@ def snipe_item(
     exclude_order_ids: set[str] | list[str] | None = None,
     max_buy_attempts: int = 2,
     burst_poll_interval: float = 0.28,
+    watch_redrop: bool = True,
+    heartbeat_poll_interval: float = 7.0,
+    redrop_timeout_seconds: float = 300.0,
+    redrop_burst_seconds: float = 60.0,
 ) -> bool:
-    """Rapid polling loop around the store's scheduled drop time."""
+    """3-Phase drop & cart-abandonment sniper loop:
+    Phase 1 (Primary Drop & 30-90s Queue Buffer):
+      - Rapid polling around scheduled drop and through the 30s-90s late release window.
+      - Tracks the timestamp when the item is first observed as sold out/claimed.
+    Phase 2 (Cart-Lock Intermission, ~minutes 2 to 4.5):
+      - Conserves API budget and resets DataDome rate limits with a relaxed heartbeat (~7s).
+    Phase 3 (5-Minute Re-Drop Surge, ~minutes 4.5 to 5.5):
+      - Ultra-burst polling (0.28s) right around the 5-minute cart expiration mark to snatch
+        re-dropped inventory if checkout was abandoned or payment failed.
+    """
     item_id = target["item_id"]
     info = target["info"]
     drop_time = target.get("drop_time")
@@ -362,11 +369,53 @@ def snipe_item(
     consecutive_errors = 0
     buy_attempts = 0
 
-    qty_str = f" (target qty: {quantity})" if quantity > 1 else ""
-    print(f"\n⚡ Entering rapid sniper mode for {info['store_name']} ({info['display_name']}){qty_str}...")
-    print(f"Checking every ~{poll_interval}s (burst ~{burst_poll_interval}s near drop) for up to {max_check_seconds}s...")
+    first_sold_out_time: float | None = None
+    redrop_target_time: float | None = None
+    phase = "primary"
+    announced_phases = set()
 
-    while time.time() - start_time < max_check_seconds:
+    print(f"\n⚡ Entering rapid sniper mode for {info['store_name']} ({info['display_name']})...")
+    print(f"Phase 1: Active drop polling (~{poll_interval}s, burst ~{burst_poll_interval}s) for up to {max_check_seconds}s...")
+
+    while True:
+        now = time.time()
+        now_dt = datetime.datetime.now(datetime.timezone.utc).astimezone()
+
+        # Phase transitions
+        if phase == "primary":
+            if now - start_time >= max_check_seconds:
+                if watch_redrop and first_sold_out_time is not None:
+                    phase = "cart_lock_rest"
+                else:
+                    break
+        elif phase == "cart_lock_rest":
+            time_until_redrop = redrop_target_time - now
+            if time_until_redrop <= 30.0:
+                phase = "redrop_surge"
+        elif phase == "redrop_surge":
+            if now > redrop_target_time + redrop_burst_seconds:
+                print(f"⏳ 5-minute re-drop window elapsed for {info['store_name']}. Bag was finalized by original buyer.")
+                return False
+
+        # Phase transition announcements
+        if phase not in announced_phases:
+            announced_phases.add(phase)
+            if phase == "cart_lock_rest":
+                time_until = int(max(0, redrop_target_time - now))
+                print(f"\n⏳ Primary drop window ended for {info['store_name']}. Bag was claimed/sold out.")
+                print(f"💤 Entering cart-lock resting phase (heartbeat ~{heartbeat_poll_interval}s) to conserve API budget.")
+                print(f"🎯 Will surge at 5-minute checkout timeout mark in {time_until}s...")
+            elif phase == "redrop_surge":
+                print(f"\n⚡ Approaching 5-minute checkout timeout mark (re-drop window active)!")
+                print(f"🚀 Entering ultra-burst sniper mode for {info['store_name']}...")
+                if auto_buy:
+                    try:
+                        from tgtg_bot.adb_buyer import prewarm_target
+                        prewarm_target(item_id, device_id=device_id)
+                    except Exception:
+                        pass
+
+        # Perform stock check
         stock = check_item_stock(client, item_id)
         if stock is None:
             consecutive_errors += 1
@@ -378,14 +427,18 @@ def snipe_item(
         consecutive_errors = 0
 
         if stock > 0:
-            actual_buy_qty = min(quantity, stock)
             target["info"]["items_available"] = stock
+            if phase == "redrop_surge":
+                print(f"\n🎉 5-MINUTE RE-DROP DETECTED! Bag released back to inventory!")
+            elif phase == "cart_lock_rest":
+                print(f"\n⚡ Early release detected during cart-lock rest! Securing bag immediately...")
+
             success, _ = secure_bag(
                 client,
                 target,
                 auto_buy=auto_buy,
                 device_id=device_id,
-                quantity=actual_buy_qty,
+                quantity=1,
                 exclude_order_ids=exclude_order_ids,
             )
             if success:
@@ -395,26 +448,43 @@ def snipe_item(
             if buy_attempts >= max_buy_attempts:
                 if auto_buy:
                     print("⚠️ Auto-buy failed while stock is available. Sending manual fallback alert...")
-                    secure_bag(client, target, auto_buy=False, quantity=actual_buy_qty)
+                    secure_bag(client, target, auto_buy=False, quantity=1)
                 return False
 
-        # Two-tier polling: high-frequency burst in [-3s, +15s] around drop_time, standard cadence otherwise
-        in_burst_window = False
-        if isinstance(drop_time, datetime.datetime):
-            now_dt = datetime.datetime.now(datetime.timezone.utc).astimezone()
-            delta = (now_dt - drop_time).total_seconds()
-            in_burst_window = -3.0 <= delta <= 15.0
+        # Record first sold-out timestamp when stock is 0 at or after drop time
+        if stock == 0 and first_sold_out_time is None:
+            is_at_or_after_drop = (drop_time is None) or (now_dt >= drop_time)
+            if is_at_or_after_drop:
+                first_sold_out_time = now
+                redrop_target_time = first_sold_out_time + redrop_timeout_seconds
 
-        if in_burst_window:
-            effective_interval = min(poll_interval, burst_poll_interval)
+        # Compute sleep interval based on current phase
+        if phase == "primary":
+            in_burst_window = False
+            if isinstance(drop_time, datetime.datetime):
+                delta = (now_dt - drop_time).total_seconds()
+                in_burst_window = -3.0 <= delta <= 15.0
+
+            if in_burst_window:
+                effective_interval = min(poll_interval, burst_poll_interval)
+                jitter = random.uniform(-0.04, 0.06)
+                floor = min(0.15, poll_interval)
+            else:
+                effective_interval = poll_interval
+                jitter = random.uniform(-0.15, 0.20)
+                floor = min(0.25, poll_interval)
+
+            time.sleep(max(floor, effective_interval + jitter))
+
+        elif phase == "cart_lock_rest":
+            effective_interval = heartbeat_poll_interval
+            jitter = random.uniform(-0.8, 0.8)
+            time.sleep(max(2.0, effective_interval + jitter))
+
+        elif phase == "redrop_surge":
+            effective_interval = burst_poll_interval
             jitter = random.uniform(-0.04, 0.06)
-            floor = min(0.15, poll_interval)
-        else:
-            effective_interval = poll_interval
-            jitter = random.uniform(-0.15, 0.20)
-            floor = min(0.25, poll_interval)
-
-        time.sleep(max(floor, effective_interval + jitter))
+            time.sleep(max(0.15, effective_interval + jitter))
 
     print(f"⏳ Drop window ended for {info['store_name']} ({max_check_seconds}s elapsed). No stock captured.")
     return False
@@ -501,6 +571,7 @@ def run_daily_sniper(
     auto_buy: bool = True,
     device_id: str | None = None,
     total_bags_target: int | None = None,
+    watch_redrop: bool = True,
 ) -> bool:
     """Run sniper across chronological targets until total_bags_target is met."""
     with prevent_system_sleep():
@@ -511,6 +582,7 @@ def run_daily_sniper(
             auto_buy=auto_buy,
             device_id=device_id,
             total_bags_target=total_bags_target,
+            watch_redrop=watch_redrop,
         )
 
 
@@ -521,23 +593,26 @@ def _run_daily_sniper_loop(
     auto_buy: bool = True,
     device_id: str | None = None,
     total_bags_target: int | None = None,
+    watch_redrop: bool = True,
 ) -> bool:
     """Internal sniper loop executed under the system sleep prevention lock."""
     if total_bags_target is None:
-        total_bags_target = sum(t.get("target_quantity", 1) for t in ranked_targets)
+        total_bags_target = len(ranked_targets)
 
     total_secured = 0
     exclude_order_ids: set[str] = _get_initial_active_order_ids(client)
 
-    print(f"\n🎯 Hunting goal: Procure {total_bags_target} total bag(s)")
+    print(f"\n🎯 Hunting goal: Procure {total_bags_target} total bag(s) (1 per location/store)")
+    if watch_redrop:
+        print("Cart re-drop monitoring: ACTIVE (watching for 5-minute checkout timeouts after sold-out drops)")
 
     for rank, target in enumerate(ranked_targets, 1):
         if total_secured >= total_bags_target:
             break
 
         remaining_needed = total_bags_target - total_secured
-        target_goal = target.get("target_quantity", 1)
-        desired_qty = min(target_goal, remaining_needed)
+        desired_qty = 1
+        target["target_quantity"] = 1
 
         info = target["info"]
         item_id = target["item_id"]
@@ -545,22 +620,21 @@ def _run_daily_sniper_loop(
 
         print(f"\n{'=' * 55}")
         print(f"🎯 Evaluating Target #{rank}: {info['store_name']} - {info['display_name']}")
-        print(f"   Target bag goal: {target_goal} bag(s) | Desired this drop: {desired_qty} bag(s) | Quota remaining: {remaining_needed}")
+        print(f"   Quota remaining: {remaining_needed} bag(s)")
         print(f"{'=' * 55}")
 
         # 1. Immediate Check: Already in stock?
         print("Checking if stock is already available right now...")
         current_stock = check_item_stock(client, item_id)
         if current_stock is not None and current_stock > 0:
-            actual_buy_qty = min(desired_qty, current_stock)
             target["info"]["items_available"] = current_stock
             success, _ = secure_bag(
                 client, target, auto_buy=auto_buy, device_id=device_id,
-                quantity=actual_buy_qty, exclude_order_ids=exclude_order_ids,
+                quantity=1, exclude_order_ids=exclude_order_ids,
             )
             if success:
                 total_secured, goal_met = _record_secured_target(
-                    target, actual_buy_qty, total_secured, total_bags_target, exclude_order_ids
+                    target, 1, total_secured, total_bags_target, exclude_order_ids
                 )
                 if goal_met:
                     return True
@@ -600,11 +674,12 @@ def _run_daily_sniper_loop(
         # 3. Enter high-frequency snipe mode
         secured = snipe_item(
             client, target, poll_interval=0.6, max_check_seconds=check_window_seconds,
-            auto_buy=auto_buy, device_id=device_id, quantity=desired_qty, exclude_order_ids=exclude_order_ids,
+            auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids,
+            watch_redrop=watch_redrop,
         )
         if secured:
             total_secured, goal_met = _record_secured_target(
-                target, desired_qty, total_secured, total_bags_target, exclude_order_ids
+                target, 1, total_secured, total_bags_target, exclude_order_ids
             )
             if goal_met:
                 return True
@@ -624,7 +699,7 @@ def main(args=None):
     parser = argparse.ArgumentParser(description="TGTG Daily Sniper & Auto-Reserver")
     parser.add_argument(
         "--top", type=str, default=None,
-        help="Comma-separated indices or index:qty pairs of your top choices (e.g. 1:2,2:1,3:3 or 1,2,3) to skip prompt",
+        help="Comma-separated indices of your top choices (e.g. 1, 2, 3) to skip prompt",
     )
     parser.add_argument(
         "--window", type=int, default=120,
@@ -633,6 +708,10 @@ def main(args=None):
     parser.add_argument(
         "--auto-buy", action=argparse.BooleanOptionalAction, default=True,
         help="Automatically purchase bag via Android emulator ADB (default: True, use --no-auto-buy for alert mode)",
+    )
+    parser.add_argument(
+        "--watch-redrop", action=argparse.BooleanOptionalAction, default=True,
+        help="Monitor 5-minute cart abandonment timeout re-drop after item sells out (default: True)",
     )
     parser.add_argument(
         "--device", type=str, default=None,
@@ -654,6 +733,7 @@ def main(args=None):
         run_daily_sniper(
             client, ranked_targets, check_window_seconds=parsed_args.window,
             auto_buy=parsed_args.auto_buy, device_id=parsed_args.device,
+            watch_redrop=parsed_args.watch_redrop,
         )
 
 

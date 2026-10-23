@@ -87,26 +87,28 @@ flowchart TD
    * **Favorites Mode**: Scans your saved favorite stores, calculates real item prices from minor units, formats pickup windows and ratings, and displays stock status.
    * **Nearby Discovery (`--nearby`)**: Discovers any available surplus bags in your area using coordinates (auto-derived from your saved favorites or set manually).
 
-4. **Daily Sniper & Multi-Bag Auto-Buyer (`sniper.py`, `adb_buyer.py`)**:
+4. **Daily Sniper with 3-Phase Re-Drop Hunting (`sniper.py`, `adb_buyer.py`)**:
    * Reads exact drop times (`next_sales_window_purchase_start`) directly from store schedules.
    * Interactive startup menu displaying upcoming drops and badges for stores with no scheduled drops.
-   * Allows picking bags to hunt with inline `index:quantity` syntax (e.g., `1:2, 2:1, 3:3`).
+   * Allows picking up to 3 bags/stores across different locations or types (e.g., `1, 2, 3`), strictly focusing on **1 bag per store** for instant, ultra-fast checkout.
    * Prioritizes **in-stock bags first**, followed by upcoming drops in **chronological order** (earliest drop time first).
+   * **Intelligent 3-Phase Adaptive Polling**:
+     - **Phase 1 (Primary Drop & 30–90s Queue Buffer):** Ultra-burst ($0.28\text{s}$) at drop time and active sub-second polling ($0.6\text{s}$) to capture delayed backend releases. Tracks the exact second the item is claimed/sold out.
+     - **Phase 2 (Cart-Lock Intermission):** Drops into a relaxed heartbeat (~$7\text{s}$) between minutes 2 and 4.5 while the bag is locked in another user's 5-minute cart countdown, conserving requests and cooling down DataDome.
+     - **Phase 3 (5-Minute Re-Drop Surge):** Snaps back into ultra-burst mode ($0.28\text{s}$) right around the 5-minute cart expiration mark ($T_{\text{sold}} + 300\text{s}$) to snatch the bag if the first buyer's checkout times out or their payment fails!
    * **Automated In-App Checkout**:
      - Pre-warms the target item page in the Android app 15 seconds before drop.
-     - High-frequency burst polling near drop time with natural human jitter.
-     - Taps the `+` stepper button on checkout to acquire requested quantities when surplus allows.
-     - Inputs card security code (CVV), dismisses the soft keyboard, and confirms payment.
+     - Inputs card security code (CVV), dismisses the soft keyboard, and confirms payment in under 1.5 seconds.
      - Verifies order transitions to `ACTIVE` state via API while excluding pre-existing active orders.
      - Retries checkout if transient issues occur and falls back to urgent WhatsApp alerts if auto-buy cannot complete.
    * **Sleep Prevention**: Automatically engages macOS `caffeinate` during snipe windows so your Mac does not go to sleep while waiting for drops.
 
 5. **Instant WhatsApp Alerts (`notifier.py`)**:
    * Dispatches alerts via the free CallMeBot gateway to your WhatsApp number.
-   * Formats messages with item details, prices, requested quantities, pickup windows, ratings, and deep links.
+   * Formats messages with item details, prices, pickup windows, ratings, and deep links.
 
 6. **Comprehensive Test Suite (`tests/`)**:
-   * 104 unit and functional tests covering authentication, parsing, token persistence, notification delivery, ADB auto-buying with keyboard handling and stepper increments, and chronological multi-target quota sniping logic.
+   * 105 unit and functional tests covering authentication, parsing, token persistence, notification delivery, ADB auto-buying with keyboard handling, 3-phase re-drop surge hunting, and chronological multi-target sniping logic.
 
 ---
 
@@ -377,19 +379,18 @@ The bot will:
         Pickup: 🧺 Today 3:30 PM - 4:00 PM
         Status: ❌ Sold out | 🕒 Drops at 03:00 PM
    ```
-3. Enter your choices with desired quantities:
-   * **Single bag per store:** `1, 2`
-   * **Multiple bags per store:** `1:2, 2:1` (requests 2 bags from Store 1, 1 bag from Store 2)
-4. The sniper organizes targets **chronologically**, sleeps with 0% CPU until 15 seconds before drop time, engages macOS sleep prevention (`caffeinate`), pre-warms the app in the emulator, initiates burst polling, increments the `+` stepper button for multi-bag orders, enters your CVV, and confirms payment.
+3. Enter your choices (up to 3 stores across locations/types, 1 bag per store):
+   * `1, 2, 3`
+4. The sniper organizes targets **chronologically**, sleeps with 0% CPU until 15 seconds before drop time, engages macOS sleep prevention (`caffeinate`), pre-warms the app in the emulator, executes the 3-phase adaptive polling, enters your CVV, and confirms payment.
 5. Sends an instant WhatsApp notification confirming the order!
 
 #### Skip the Prompt (CLI Flags):
 ```bash
-# Target store 1 (2 bags) and store 2 (1 bag) automatically:
-uv run python -m tgtg_bot.sniper --top 1:2,2:1
+# Target stores 1, 2, and 3 (1 bag per store):
+uv run python -m tgtg_bot.sniper --top 1,2,3
 
-# Target stores 1 and 2 (1 bag each):
-uv run python -m tgtg_bot.sniper --top 1,2
+# Disable 5-minute cart abandonment re-drop monitoring (primary drop only):
+uv run python -m tgtg_bot.sniper --top 1,2 --no-watch-redrop
 ```
 
 #### Mode B: Alert-Only Mode (`--no-auto-buy`)
@@ -403,6 +404,9 @@ When a drop occurs, the sniper immediately sends a WhatsApp alert with a direct 
 ```bash
 # Adjust drop observation window in seconds (default: 120s):
 uv run python -m tgtg_bot.sniper --window 180
+
+# Control cart timeout re-drop monitoring (default: True):
+uv run python -m tgtg_bot.sniper --watch-redrop
 
 # Target a specific ADB device if multiple are connected:
 uv run python -m tgtg_bot.sniper --device emulator-5554

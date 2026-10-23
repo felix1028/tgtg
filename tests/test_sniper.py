@@ -95,20 +95,20 @@ class TestPromptUserRanking:
             prompt_user_ranking(mock_favorites, user_input="   ")
 
     def test_prompt_user_ranking_with_inline_quantities(self, mock_favorites):
-        # 2 of first, 1 of second, 3 of third
+        # Even if user enters inline quantities, each selected store targets strictly 1 bag
         ranked = prompt_user_ranking(mock_favorites, user_input="1:2, 2:1, 3:3")
         assert len(ranked) == 3
-        assert ranked[0]["target_quantity"] == 2
+        assert ranked[0]["target_quantity"] == 1
         assert ranked[1]["target_quantity"] == 1
-        assert ranked[2]["target_quantity"] == 3
+        assert ranked[2]["target_quantity"] == 1
 
     def test_prompt_user_ranking_with_x_syntax(self, mock_favorites):
-        # 2 of first, 1 of second, 3 of third using 1x2 syntax
+        # Even with 1x2 syntax, each selected store targets strictly 1 bag
         ranked = prompt_user_ranking(mock_favorites, user_input="1x2, 2x1, 3x3")
         assert len(ranked) == 3
-        assert ranked[0]["target_quantity"] == 2
+        assert ranked[0]["target_quantity"] == 1
         assert ranked[1]["target_quantity"] == 1
-        assert ranked[2]["target_quantity"] == 3
+        assert ranked[2]["target_quantity"] == 1
 
 
 class TestDisplayMenu:
@@ -428,9 +428,8 @@ class TestSnipeAndRunDaily:
 
     @patch("tgtg_bot.sniper.secure_bag")
     @patch("tgtg_bot.sniper.check_item_stock")
-    def test_run_daily_sniper_per_target_quantities(self, mock_stock, mock_secure):
-        # Target 1 needs 2, Target 2 needs 1, Target 3 needs 3
-        # Stock: Target 1 has 2, Target 2 has 1, Target 3 has 3
+    def test_run_daily_sniper_one_bag_per_target(self, mock_stock, mock_secure):
+        # 3 different store targets, each strictly targets 1 bag
         mock_stock.side_effect = [2, 1, 3]
 
         def fake_secure(client, target, quantity=1, **kwargs):
@@ -442,29 +441,29 @@ class TestSnipeAndRunDaily:
         mock_client = MagicMock()
 
         ranked = [
-            {"item_id": "t1", "info": {"store_name": "Store 1", "display_name": "Bag 1"}, "drop_time": None, "target_quantity": 2},
-            {"item_id": "t2", "info": {"store_name": "Store 2", "display_name": "Bag 2"}, "drop_time": None, "target_quantity": 1},
-            {"item_id": "t3", "info": {"store_name": "Store 3", "display_name": "Bag 3"}, "drop_time": None, "target_quantity": 3},
+            {"item_id": "t1", "info": {"store_name": "Store 1", "display_name": "Bag 1"}, "drop_time": None},
+            {"item_id": "t2", "info": {"store_name": "Store 2", "display_name": "Bag 2"}, "drop_time": None},
+            {"item_id": "t3", "info": {"store_name": "Store 3", "display_name": "Bag 3"}, "drop_time": None},
         ]
 
-        # total_bags_target = 2 + 1 + 3 = 6
+        # Targets 3 stores, 1 bag each = goal of 3 bags
         success = run_daily_sniper(
             mock_client,
             ranked,
-            total_bags_target=6,
+            total_bags_target=3,
         )
         assert success is True
         assert mock_secure.call_count == 3
-        # Verify quantities passed to secure_bag for each call
-        assert mock_secure.call_args_list[0].kwargs["quantity"] == 2
+        # Verify quantity passed to secure_bag for each call is strictly 1
+        assert mock_secure.call_args_list[0].kwargs["quantity"] == 1
         assert mock_secure.call_args_list[1].kwargs["quantity"] == 1
-        assert mock_secure.call_args_list[2].kwargs["quantity"] == 3
+        assert mock_secure.call_args_list[2].kwargs["quantity"] == 1
 
     @patch("tgtg_bot.sniper.secure_bag")
     @patch("tgtg_bot.sniper.check_item_stock")
-    def test_run_daily_sniper_partial_stock_available(self, mock_stock, mock_secure):
-        # User requested 2 bags for Target 1, but store only has 1 in stock
-        mock_stock.return_value = 1
+    def test_run_daily_sniper_single_bag_per_store_limit(self, mock_stock, mock_secure):
+        # Store has multiple bags in stock, but bot procures strictly 1
+        mock_stock.return_value = 5
 
         def fake_secure(client, target, quantity=1, **kwargs):
             target["last_order"] = {"order_id": f"ord_{target['item_id']}"}
@@ -475,16 +474,45 @@ class TestSnipeAndRunDaily:
         mock_client = MagicMock()
 
         ranked = [
-            {"item_id": "t1", "info": {"store_name": "Store 1", "display_name": "Bag 1"}, "drop_time": None, "target_quantity": 2},
+            {"item_id": "t1", "info": {"store_name": "Store 1", "display_name": "Bag 1"}, "drop_time": None},
         ]
 
         success = run_daily_sniper(
             mock_client,
             ranked,
-            total_bags_target=2,
+            total_bags_target=1,
         )
         assert success is True
-        # secure_bag was called with quantity=1 (capped to available stock)
+        mock_secure.assert_called_once()
+        assert mock_secure.call_args.kwargs["quantity"] == 1
+
+    @patch("tgtg_bot.sniper.secure_bag", return_value=(True, "purchased"))
+    @patch("tgtg_bot.sniper.check_item_stock")
+    def test_snipe_item_three_phase_redrop_capture(self, mock_stock, mock_secure):
+        # Phase 1: Item is sold out (stock = 0), establishing first_sold_out_time
+        # Phase 2: Cart-lock rest (heartbeat polling)
+        # Phase 3: At 5m timeout, cart expires and stock returns to 1!
+        mock_stock.side_effect = [0, 0, 1]
+        mock_client = MagicMock()
+        target = {
+            "item_id": "item-redrop",
+            "info": {"store_name": "Eataly", "display_name": "Prime Bag", "items_available": 0},
+            "drop_time": None,
+        }
+
+        with patch("time.sleep"):
+            # Set short test durations for fast unit test execution
+            secured = snipe_item(
+                mock_client,
+                target,
+                poll_interval=0.01,
+                max_check_seconds=0.05,
+                watch_redrop=True,
+                heartbeat_poll_interval=0.01,
+                redrop_timeout_seconds=0.10,
+                redrop_burst_seconds=0.10,
+            )
+        assert secured is True
         mock_secure.assert_called_once()
         assert mock_secure.call_args.kwargs["quantity"] == 1
 
