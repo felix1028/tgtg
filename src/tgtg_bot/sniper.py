@@ -33,6 +33,7 @@ from tgtg_bot.items import (
 )
 from tgtg_bot.monitor import get_client
 from tgtg_bot.notifier import send_whatsapp_message
+from tgtg_bot.stats import get_drop_tracker
 
 load_dotenv()
 
@@ -109,12 +110,17 @@ def display_menu(favorites: list[dict]) -> None:
         info = fav["info"]
         tag_ids = fav.get("tag_ids") or get_item_tag_ids(fav.get("raw_item", {}))
 
+        profile = get_drop_tracker().get_store_profile(fav.get("item_id", ""))
+        delay_badge = ""
+        if profile and profile.get("median_primary_delay_seconds") is not None:
+            delay_badge = f" (avg +{profile['median_primary_delay_seconds']}s late)"
+
         if fav["items_available"] > 0:
             stock_badge = f"✅ IN STOCK ({fav['items_available']})"
             drop_badge = "Available right now!"
         elif fav["is_future_drop"]:
             stock_badge = "❌ Sold out"
-            drop_badge = f"🕒 Drops at {fav['drop_time_str']}"
+            drop_badge = f"🕒 Drops at {fav['drop_time_str']}{delay_badge}"
         elif "NOTHING_TO_SAVE_TODAY" in tag_ids:
             stock_badge = "❌ Sold out"
             drop_badge = "💤 Nothing to save today"
@@ -390,7 +396,9 @@ def snipe_item(
                     break
         elif phase == "cart_lock_rest":
             time_until_redrop = redrop_target_time - now
-            if time_until_redrop <= 30.0:
+            # Transition to surge ~23 seconds before 5-minute timeout (with anti-bot jitter)
+            adaptive_lead = 23.0 + random.uniform(-1.5, 1.5)
+            if time_until_redrop <= adaptive_lead:
                 phase = "redrop_surge"
         elif phase == "redrop_surge":
             if now > redrop_target_time + redrop_burst_seconds:
@@ -441,6 +449,22 @@ def snipe_item(
                 quantity=1,
                 exclude_order_ids=exclude_order_ids,
             )
+
+            # Record drop event metrics in persistent DropStatsTracker
+            try:
+                get_drop_tracker().record_drop(
+                    item_id=item_id,
+                    store_name=info.get("store_name", "Store"),
+                    actual_stock_time=now,
+                    scheduled_drop_time=drop_time,
+                    event_type="primary" if phase == "primary" else "redrop",
+                    sold_out_time=first_sold_out_time,
+                    secured=success,
+                    quantity_available=stock,
+                )
+            except Exception:
+                pass
+
             if success:
                 return True
 
@@ -709,7 +733,7 @@ def _run_daily_sniper_loop(
             time_until_rd = earliest_redrop["redrop_target_time"] - now_ts
 
             # Case A: Deferred re-drop (its 5-minute mark passed while the primary drop was running)
-            if time_until_rd < -30.0:
+            if time_until_rd < -23.0:
                 target = pending_redrop.pop(0)
                 info = target["info"]
                 item_id = target["item_id"]
@@ -718,6 +742,19 @@ def _run_daily_sniper_loop(
                 if stock and stock > 0:
                     print(f"🎉 Deferred re-drop in stock for {info['store_name']}! Securing bag...")
                     success, _ = secure_bag(client, target, auto_buy=auto_buy, device_id=device_id, quantity=1, exclude_order_ids=exclude_order_ids)
+                    try:
+                        get_drop_tracker().record_drop(
+                            item_id=item_id,
+                            store_name=info.get("store_name", "Store"),
+                            actual_stock_time=time.time(),
+                            scheduled_drop_time=target.get("drop_time"),
+                            event_type="redrop",
+                            sold_out_time=target.get("first_sold_out_time"),
+                            secured=success,
+                            quantity_available=stock,
+                        )
+                    except Exception:
+                        pass
                     if success:
                         total_secured, goal_met = _record_secured_target(target, total_secured, total_bags_target, exclude_order_ids)
                         if goal_met:
@@ -726,8 +763,9 @@ def _run_daily_sniper_loop(
                     print(f"⏳ Deferred re-drop check for {info['store_name']} showed no stock.")
                 continue
 
-            # Case B: Re-drop is due right now (within 30 seconds of its 5-minute mark)
-            if time_until_rd <= 30.0:
+            # Case B: Re-drop is due right now (within ~23 seconds of its 5-minute mark)
+            lead_surge = 23.0 + random.uniform(-1.5, 1.5)
+            if time_until_rd <= lead_surge:
                 target = pending_redrop.pop(0)
                 info = target["info"]
                 item_id = target["item_id"]
@@ -771,7 +809,7 @@ def _run_daily_sniper_loop(
         # Case C: Idle period between upcoming events (neither primary nor re-drop is due right now)
         earliest_event_sec = seconds_until_primary - lead_time
         if pending_redrop:
-            rd_sec = pending_redrop[0]["redrop_target_time"] - now_ts - 30.0
+            rd_sec = pending_redrop[0]["redrop_target_time"] - now_ts - 23.0
             if rd_sec < earliest_event_sec:
                 earliest_event_sec = rd_sec
 
@@ -808,7 +846,15 @@ def main(args=None):
         "--device", type=str, default=None,
         help="Specific ADB device or emulator identifier (default: first online device)",
     )
+    parser.add_argument(
+        "--stats", action="store_true", default=False,
+        help="Display historical drop latency and re-drop statistics table and exit",
+    )
     parsed_args = parser.parse_args(args)
+
+    if parsed_args.stats:
+        get_drop_tracker().display_stats_summary()
+        return
 
     with prevent_system_sleep():
         client = get_client()

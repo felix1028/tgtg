@@ -416,6 +416,9 @@ uv run python -m tgtg_bot.sniper --watch-redrop
 
 # Target a specific ADB device if multiple are connected:
 uv run python -m tgtg_bot.sniper --device emulator-5554
+
+# Display historical drop latency and re-drop statistics table:
+uv run python -m tgtg_bot.sniper --stats
 ```
 
 ---
